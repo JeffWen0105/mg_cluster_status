@@ -11,7 +11,6 @@
 # Requirements:
 #   collections:
 #     - kubernetes.core
-#     - community.crypto
 #
 # Authentication (choose one):
 #   Option A) kubeconfig file:
@@ -347,42 +346,75 @@
         ingress_secret_result.resources | length == 0
         or ingress_secret_result.resources[0].data['tls.crt'] is not defined
 
-    - name: "[INGRESS CERT] Inspect certificate details"
-      community.crypto.x509_certificate_info:
-        content: "{{ ingress_tls_crt }}"
-      register: ingress_cert_info
+    - name: "[INGRESS CERT] Create temp file for certificate"
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .crt
+      register: ingress_cert_tmp
       when: ingress_tls_crt is defined
+
+    - name: "[INGRESS CERT] Write cert to temp file"
+      ansible.builtin.copy:
+        content: "{{ ingress_tls_crt }}"
+        dest: "{{ ingress_cert_tmp.path }}"
+        mode: '0600'
+      when: ingress_tls_crt is defined and ingress_cert_tmp is defined
+
+    - name: "[INGRESS CERT] Inspect certificate with openssl"
+      # Requires GNU date (Linux / RHEL). openssl called once; notAfter parsed from its output.
+      ansible.builtin.shell: |
+        set -e
+        CERT="{{ ingress_cert_tmp.path }}"
+        OUT=$(openssl x509 -noout -subject -issuer -dates -ext subjectAltName -in "$CERT")
+        echo "$OUT"
+        END_DATE=$(echo "$OUT" | grep '^notAfter=' | cut -d= -f2)
+        END_EPOCH=$(date -d "$END_DATE" +%s)
+        NOW_EPOCH=$(date +%s)
+        echo "days_remaining=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))"
+      register: ingress_cert_raw
+      when: ingress_tls_crt is defined and ingress_cert_tmp is defined
+
+    - name: "[INGRESS CERT] Parse days remaining"
+      ansible.builtin.set_fact:
+        ingress_cert_days_remaining: >-
+          {{
+            ingress_cert_raw.stdout_lines
+            | select('match', '^days_remaining=')
+            | map('regex_replace', '^days_remaining=', '')
+            | first | int
+          }}
+      when: ingress_tls_crt is defined and ingress_cert_raw is defined
 
     - name: "[INGRESS CERT] Show certificate validity"
       ansible.builtin.debug:
-        msg:
-          - "Secret         : {{ ingress_cert_secret_name }} (namespace: openshift-ingress)"
-          - "Subject        : {{ ingress_cert_info.subject }}"
-          - "Issuer         : {{ ingress_cert_info.issuer }}"
-          - "SANs (DNS)     : {{ ingress_cert_info.subject_alt_name | select('match', '^DNS:') | list }}"
-          - "Not Before     : {{ ingress_cert_info.not_before }}"
-          - "Not After      : {{ ingress_cert_info.not_after }}"
-          - "Expired        : {{ ingress_cert_info.expired }}"
-          - "Days remaining : {{ ((ingress_cert_info.not_after | to_datetime('%Y%m%d%H%M%SZ')) - (now(utc=true))).days }}"
-      when: ingress_cert_info is defined
+        msg: >-
+          Secret={{ ingress_cert_secret_name }} (namespace: openshift-ingress)
+          {{ ingress_cert_raw.stdout_lines | reject('match', '^days_remaining=') | join(' | ') }}
+          days_remaining={{ ingress_cert_days_remaining }}
+      when: ingress_tls_crt is defined and ingress_cert_raw is defined
 
     - name: "[INGRESS CERT] Warn if certificate is expired"
       ansible.builtin.debug:
         msg: "CRITICAL: Ingress certificate {{ ingress_cert_secret_name }} is EXPIRED!"
       when:
-        - ingress_cert_info is defined
-        - ingress_cert_info.expired
+        - ingress_tls_crt is defined
+        - ingress_cert_days_remaining is defined
+        - ingress_cert_days_remaining | int <= 0
 
     - name: "[INGRESS CERT] Warn if certificate is expiring soon"
       ansible.builtin.debug:
         msg: >-
           WARNING: Ingress certificate {{ ingress_cert_secret_name }} expires within
           {{ cert_warning_days }} days
-          (not_after={{ ingress_cert_info.not_after }})
+          (days_remaining={{ ingress_cert_days_remaining }})
       when:
-        - ingress_cert_info is defined
-        - not ingress_cert_info.expired
-        - >-
-          ((ingress_cert_info.not_after | to_datetime('%Y%m%d%H%M%SZ'))
-           - (now(utc=true))).days
-          < cert_warning_days
+        - ingress_tls_crt is defined
+        - ingress_cert_days_remaining is defined
+        - ingress_cert_days_remaining | int > 0
+        - ingress_cert_days_remaining | int < cert_warning_days | int
+
+    - name: "[INGRESS CERT] Remove temp cert file"
+      ansible.builtin.file:
+        path: "{{ ingress_cert_tmp.path }}"
+        state: absent
+      when: ingress_cert_tmp is defined and ingress_cert_tmp.path is defined
