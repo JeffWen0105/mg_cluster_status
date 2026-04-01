@@ -1,0 +1,388 @@
+---
+# =============================================================================
+# OCP OP Daily Inspection Playbook
+# =============================================================================
+# Covers:
+#   1. ETCD STATUS
+#   2. MACHINE CONFIG OPERATOR STATUS
+#   3. NODE STATUS
+#   4. Default Ingress Certificate
+#
+# Requirements:
+#   collections:
+#     - kubernetes.core
+#     - community.crypto
+#
+# Authentication (choose one):
+#   Option A) kubeconfig file:
+#       ansible-playbook ocp_daily_inspection.yml -e kubeconfig=/path/to/kubeconfig
+#   Option B) cert/key/CA:
+#       ansible-playbook ocp_daily_inspection.yml \
+#         -e ocp_api_url=https://api.cluster.example.com:6443 \
+#         -e ocp_client_cert=/path/to/admin.crt \
+#         -e ocp_client_key=/path/to/admin.key \
+#         -e ocp_ca_cert=/path/to/ca.crt
+# =============================================================================
+
+- name: OCP OP Daily Inspection
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # --- Authentication (Option A: kubeconfig) --------------------------------
+    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(omit) }}"
+
+    # --- Authentication (Option B: cert / key / CA) --------------------------
+    # ocp_api_url: "https://api.cluster.example.com:6443"
+    # ocp_client_cert: "/path/to/admin.crt"
+    # ocp_client_key: "/path/to/admin.key"
+    # ocp_ca_cert: "/path/to/ca.crt"
+
+    # --- Thresholds -----------------------------------------------------------
+    cert_warning_days: 30   # warn when certificate expires within this many days
+
+  # ---------------------------------------------------------------------------
+  # Common connection arguments built dynamically so both auth options work.
+  # ---------------------------------------------------------------------------
+  pre_tasks:
+    - name: Build k8s connection arguments
+      ansible.builtin.set_fact:
+        k8s_auth: >-
+          {{
+            (kubeconfig is defined and kubeconfig)
+            | ternary(
+                {'kubeconfig': kubeconfig},
+                {
+                  'host':        ocp_api_url,
+                  'client_cert': ocp_client_cert,
+                  'client_key':  ocp_client_key,
+                  'ca_cert':     ocp_ca_cert,
+                  'validate_certs': true
+                }
+              )
+          }}
+
+  tasks:
+
+    # =========================================================================
+    # 1. NODE STATUS
+    # =========================================================================
+    - name: "[NODE STATUS] Get all nodes"
+      kubernetes.core.k8s_info:
+        kind: Node
+        api_version: v1
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: nodes_result
+
+    - name: "[NODE STATUS] Summarise nodes"
+      ansible.builtin.debug:
+        msg: >-
+          NODE={{ item.metadata.name }}
+          ROLES={{ item.metadata.labels
+                    | dict2items
+                    | selectattr('key', 'match', '^node-role.kubernetes.io/')
+                    | map(attribute='key')
+                    | map('regex_replace', '^node-role.kubernetes.io/', '')
+                    | join(',') }}
+          STATUS={{ item.status.conditions
+                      | selectattr('type', 'equalto', 'Ready')
+                      | map(attribute='status')
+                      | first }}
+      loop: "{{ nodes_result.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "[NODE STATUS] List NotReady nodes"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Node {{ item.metadata.name }} is NOT Ready
+          (lastTransition={{ item.status.conditions
+                              | selectattr('type', 'equalto', 'Ready')
+                              | map(attribute='lastTransitionTime')
+                              | first }})
+      loop: "{{ nodes_result.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: >-
+        (item.status.conditions
+          | selectattr('type', 'equalto', 'Ready')
+          | map(attribute='status')
+          | first) != 'True'
+
+    - name: "[NODE STATUS] Get pending / unapproved CSRs"
+      kubernetes.core.k8s_info:
+        api_version: certificates.k8s.io/v1
+        kind: CertificateSigningRequest
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: csr_result
+
+    - name: "[NODE STATUS] Show pending CSRs"
+      ansible.builtin.debug:
+        msg: >-
+          PENDING CSR: {{ item.metadata.name }}
+          signer={{ item.spec.signerName }}
+          requestor={{ item.spec.username }}
+          created={{ item.metadata.creationTimestamp }}
+      loop: "{{ csr_result.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: >-
+        (item.status.conditions is not defined or item.status.conditions | length == 0)
+
+    # =========================================================================
+    # 2. MACHINE CONFIG OPERATOR STATUS
+    # =========================================================================
+    - name: "[MCO STATUS] Get MachineConfigPools"
+      kubernetes.core.k8s_info:
+        api_version: machineconfiguration.openshift.io/v1
+        kind: MachineConfigPool
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: mcp_result
+
+    - name: "[MCO STATUS] Summarise MachineConfigPools"
+      ansible.builtin.debug:
+        msg: >-
+          MCP={{ item.metadata.name }}
+          UPDATED={{ item.status.conditions
+                      | selectattr('type', 'equalto', 'Updated')
+                      | map(attribute='status')
+                      | first | default('Unknown') }}
+          UPDATING={{ item.status.conditions
+                       | selectattr('type', 'equalto', 'Updating')
+                       | map(attribute='status')
+                       | first | default('Unknown') }}
+          DEGRADED={{ item.status.conditions
+                       | selectattr('type', 'equalto', 'Degraded')
+                       | map(attribute='status')
+                       | first | default('Unknown') }}
+          machineCount={{ item.status.machineCount }}
+          readyMachineCount={{ item.status.readyMachineCount }}
+          updatedMachineCount={{ item.status.updatedMachineCount }}
+          degradedMachineCount={{ item.status.degradedMachineCount }}
+      loop: "{{ mcp_result.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "[MCO STATUS] Warn on degraded MachineConfigPools"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: MachineConfigPool {{ item.metadata.name }} is DEGRADED
+          (degradedMachineCount={{ item.status.degradedMachineCount }})
+      loop: "{{ mcp_result.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: >-
+        (item.status.conditions
+          | selectattr('type', 'equalto', 'Degraded')
+          | map(attribute='status')
+          | first | default('False')) == 'True'
+
+    - name: "[MCO STATUS] Show node-level MCO state via node annotations"
+      ansible.builtin.debug:
+        msg: >-
+          NODE={{ item.metadata.name }}
+          currentConfig={{ item.metadata.annotations['machineconfiguration.openshift.io/currentConfig'] | default('N/A') }}
+          desiredConfig={{ item.metadata.annotations['machineconfiguration.openshift.io/desiredConfig'] | default('N/A') }}
+          state={{ item.metadata.annotations['machineconfiguration.openshift.io/state'] | default('N/A') }}
+          IN_SYNC={{ (item.metadata.annotations['machineconfiguration.openshift.io/currentConfig'] | default(''))
+                     == (item.metadata.annotations['machineconfiguration.openshift.io/desiredConfig'] | default('')) }}
+      loop: "{{ nodes_result.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    # =========================================================================
+    # 3. ETCD STATUS
+    # =========================================================================
+    - name: "[ETCD STATUS] Get etcd pods (openshift-etcd)"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: openshift-etcd
+        label_selectors:
+          - "k8s-app=etcd"
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: etcd_pods_result
+
+    - name: "[ETCD STATUS] Select a Running etcd pod"
+      ansible.builtin.set_fact:
+        etcd_pod_name: >-
+          {{
+            etcd_pods_result.resources
+            | selectattr('status.phase', 'equalto', 'Running')
+            | map(attribute='metadata.name')
+            | first
+          }}
+
+    - name: "[ETCD STATUS] etcdctl endpoint health"
+      kubernetes.core.k8s_exec:
+        namespace: openshift-etcd
+        pod: "{{ etcd_pod_name }}"
+        container: etcdctl
+        command: "etcdctl endpoint health -w table"
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: etcd_health_result
+
+    - name: "[ETCD STATUS] Show etcdctl endpoint health"
+      ansible.builtin.debug:
+        msg: "{{ etcd_health_result.stdout_lines }}"
+
+    - name: "[ETCD STATUS] etcdctl endpoint status"
+      kubernetes.core.k8s_exec:
+        namespace: openshift-etcd
+        pod: "{{ etcd_pod_name }}"
+        container: etcdctl
+        command: "etcdctl endpoint status -w table"
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: etcd_status_result
+
+    - name: "[ETCD STATUS] Show etcdctl endpoint status"
+      ansible.builtin.debug:
+        msg: "{{ etcd_status_result.stdout_lines }}"
+
+    - name: "[ETCD STATUS] etcdctl member list"
+      kubernetes.core.k8s_exec:
+        namespace: openshift-etcd
+        pod: "{{ etcd_pod_name }}"
+        container: etcdctl
+        command: "etcdctl member list -w table"
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: etcd_members_result
+
+    - name: "[ETCD STATUS] Show etcdctl member list"
+      ansible.builtin.debug:
+        msg: "{{ etcd_members_result.stdout_lines }}"
+
+    # =========================================================================
+    # 4. Default Ingress Certificate
+    # =========================================================================
+    - name: "[INGRESS CERT] Get default IngressController"
+      kubernetes.core.k8s_info:
+        api_version: operator.openshift.io/v1
+        kind: IngressController
+        namespace: openshift-ingress-operator
+        name: default
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: ingress_ctrl_result
+
+    - name: "[INGRESS CERT] Resolve certificate secret name"
+      ansible.builtin.set_fact:
+        ingress_cert_secret_name: >-
+          {{
+            ingress_ctrl_result.resources[0].spec.defaultCertificate.name
+            | default('router-certs-default')
+            if (ingress_ctrl_result.resources[0].spec.defaultCertificate is defined
+                and ingress_ctrl_result.resources[0].spec.defaultCertificate.name is defined
+                and ingress_ctrl_result.resources[0].spec.defaultCertificate.name != None)
+            else 'router-certs-default'
+          }}
+
+    - name: "[INGRESS CERT] Get certificate secret from openshift-ingress"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        namespace: openshift-ingress
+        name: "{{ ingress_cert_secret_name }}"
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: ingress_secret_result
+
+    - name: "[INGRESS CERT] Decode tls.crt from secret"
+      ansible.builtin.set_fact:
+        ingress_tls_crt: >-
+          {{ ingress_secret_result.resources[0].data['tls.crt'] | b64decode }}
+      when: >-
+        ingress_secret_result.resources | length > 0
+        and ingress_secret_result.resources[0].data['tls.crt'] is defined
+
+    - name: "[INGRESS CERT] Warn when secret is missing or empty"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Secret {{ ingress_cert_secret_name }} not found in namespace
+          openshift-ingress or has invalid data.
+      when: >-
+        ingress_secret_result.resources | length == 0
+        or ingress_secret_result.resources[0].data['tls.crt'] is not defined
+
+    - name: "[INGRESS CERT] Inspect certificate details"
+      community.crypto.x509_certificate_info:
+        content: "{{ ingress_tls_crt }}"
+      register: ingress_cert_info
+      when: ingress_tls_crt is defined
+
+    - name: "[INGRESS CERT] Show certificate validity"
+      ansible.builtin.debug:
+        msg:
+          - "Secret         : {{ ingress_cert_secret_name }} (namespace: openshift-ingress)"
+          - "Subject        : {{ ingress_cert_info.subject }}"
+          - "Issuer         : {{ ingress_cert_info.issuer }}"
+          - "SANs (DNS)     : {{ ingress_cert_info.subject_alt_name | select('match', '^DNS:') | list }}"
+          - "Not Before     : {{ ingress_cert_info.not_before }}"
+          - "Not After      : {{ ingress_cert_info.not_after }}"
+          - "Expired        : {{ ingress_cert_info.expired }}"
+          - "Days remaining : {{ ((ingress_cert_info.not_after | to_datetime('%Y%m%d%H%M%SZ')) - (now(utc=true))).days }}"
+      when: ingress_cert_info is defined
+
+    - name: "[INGRESS CERT] Warn if certificate is expired"
+      ansible.builtin.debug:
+        msg: "CRITICAL: Ingress certificate {{ ingress_cert_secret_name }} is EXPIRED!"
+      when:
+        - ingress_cert_info is defined
+        - ingress_cert_info.expired
+
+    - name: "[INGRESS CERT] Warn if certificate is expiring soon"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Ingress certificate {{ ingress_cert_secret_name }} expires within
+          {{ cert_warning_days }} days
+          (not_after={{ ingress_cert_info.not_after }})
+      when:
+        - ingress_cert_info is defined
+        - not ingress_cert_info.expired
+        - >-
+          ((ingress_cert_info.not_after | to_datetime('%Y%m%d%H%M%SZ'))
+           - (now(utc=true))).days
+          < cert_warning_days
