@@ -120,14 +120,14 @@
         _ready: >-
           {{ item.status.conditions
              | selectattr('type', 'equalto', 'Ready')
-             | map(attribute='status') | first }}
+             | map(attribute='status') | first | string }}
         _roles: >-
           {{ item.metadata.labels
              | dict2items
              | selectattr('key', 'match', '^node-role.kubernetes.io/')
              | map(attribute='key')
              | map('regex_replace', '^node-role.kubernetes.io/', '')
-             | join(',') }}
+             | join(',') | string }}
       loop: "{{ nodes_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
@@ -149,7 +149,7 @@
       when: >-
         (item.status.conditions
           | selectattr('type', 'equalto', 'Ready')
-          | map(attribute='status') | first) != 'True'
+          | map(attribute='status') | first | string) != 'True'
 
     - name: "[1/4 NODE] Get pending / unapproved CSRs"
       kubernetes.core.k8s_info:
@@ -247,13 +247,13 @@
       vars:
         _updated: >-
           {{ item.status.conditions | selectattr('type', 'equalto', 'Updated')
-             | map(attribute='status') | first | default('Unknown') }}
+             | map(attribute='status') | first | string | default('Unknown') }}
         _updating: >-
           {{ item.status.conditions | selectattr('type', 'equalto', 'Updating')
-             | map(attribute='status') | first | default('Unknown') }}
+             | map(attribute='status') | first | string | default('Unknown') }}
         _degraded: >-
           {{ item.status.conditions | selectattr('type', 'equalto', 'Degraded')
-             | map(attribute='status') | first | default('Unknown') }}
+             | map(attribute='status') | first | string | default('Unknown') }}
       loop: "{{ mcp_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
