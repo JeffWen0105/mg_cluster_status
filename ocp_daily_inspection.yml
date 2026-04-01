@@ -3,9 +3,9 @@
 # OCP OP Daily Inspection Playbook
 # =============================================================================
 # Covers:
-#   1. ETCD STATUS
-#   2. MACHINE CONFIG OPERATOR STATUS
-#   3. NODE STATUS
+#   1. Node Status & CSR
+#   2. Machine Config Operator (MCO) Status
+#   3. ETCD Health
 #   4. Default Ingress Certificate
 #
 # Requirements:
@@ -21,6 +21,13 @@
 #         -e ocp_client_cert=/path/to/admin.crt \
 #         -e ocp_client_key=/path/to/admin.key \
 #         -e ocp_ca_cert=/path/to/ca.crt
+#
+# Output guide (visible in AAP job output):
+#   Each section prints a formatted block.
+#   [OK]   = normal, no action needed
+#   [WARN] = attention required, investigate soon
+#   [CRIT] = immediate action required
+#   The final task prints a one-page CLUSTER HEALTH SUMMARY.
 # =============================================================================
 
 - name: OCP OP Daily Inspection
@@ -61,12 +68,32 @@
               )
           }}
 
+    - name: Initialise issue tracker
+      ansible.builtin.set_fact:
+        _issues: []
+
+    - name: ">>> Inspection START <<<"
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "  OCP Cluster Daily Inspection"
+          - "  Time    : {{ now(utc=true, fmt='%Y-%m-%d %H:%M UTC') }}"
+          - "============================================================"
+          - "  Checks  : 1=Nodes/CSR  2=MCO  3=ETCD  4=Ingress Cert"
+          - "------------------------------------------------------------"
+          - "  How to read this output:"
+          - "    [OK]   = Normal, no action needed"
+          - "    [WARN] = Investigate soon"
+          - "    [CRIT] = Immediate action required"
+          - "  >>> Scroll to the bottom for the SUMMARY <<<  "
+          - "============================================================"
+
   tasks:
 
     # =========================================================================
     # 1. NODE STATUS
     # =========================================================================
-    - name: "[NODE STATUS] Get all nodes"
+    - name: "[1/4 NODE] Get all nodes"
       kubernetes.core.k8s_info:
         kind: Node
         api_version: v1
@@ -78,42 +105,53 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: nodes_result
 
-    - name: "[NODE STATUS] Summarise nodes"
-      ansible.builtin.debug:
-        msg: >-
-          NODE={{ item.metadata.name }}
-          ROLES={{ item.metadata.labels
-                    | dict2items
-                    | selectattr('key', 'match', '^node-role.kubernetes.io/')
-                    | map(attribute='key')
-                    | map('regex_replace', '^node-role.kubernetes.io/', '')
-                    | join(',') }}
-          STATUS={{ item.status.conditions
-                      | selectattr('type', 'equalto', 'Ready')
-                      | map(attribute='status')
-                      | first }}
+    - name: "[1/4 NODE] Build per-node display line"
+      ansible.builtin.set_fact:
+        _node_lines: >-
+          {{
+            _node_lines | default([]) + [
+              ('[OK]   ' if _ready == 'True' else '[CRIT] ')
+              + item.metadata.name
+              + '  roles=' + _roles
+              + '  Ready=' + _ready
+            ]
+          }}
+      vars:
+        _ready: >-
+          {{ item.status.conditions
+             | selectattr('type', 'equalto', 'Ready')
+             | map(attribute='status') | first }}
+        _roles: >-
+          {{ item.metadata.labels
+             | dict2items
+             | selectattr('key', 'match', '^node-role.kubernetes.io/')
+             | map(attribute='key')
+             | map('regex_replace', '^node-role.kubernetes.io/', '')
+             | join(',') }}
       loop: "{{ nodes_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
 
-    - name: "[NODE STATUS] List NotReady nodes"
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: Node {{ item.metadata.name }} is NOT Ready
-          (lastTransition={{ item.status.conditions
+    - name: "[1/4 NODE] Track not-ready nodes"
+      ansible.builtin.set_fact:
+        _issues: >-
+          {{
+            _issues + [
+              '[CRIT] Node ' + item.metadata.name + ' NOT Ready'
+              + ' (since ' + (item.status.conditions
                               | selectattr('type', 'equalto', 'Ready')
-                              | map(attribute='lastTransitionTime')
-                              | first }})
+                              | map(attribute='lastTransitionTime') | first) + ')'
+            ]
+          }}
       loop: "{{ nodes_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
       when: >-
         (item.status.conditions
           | selectattr('type', 'equalto', 'Ready')
-          | map(attribute='status')
-          | first) != 'True'
+          | map(attribute='status') | first) != 'True'
 
-    - name: "[NODE STATUS] Get pending / unapproved CSRs"
+    - name: "[1/4 NODE] Get pending / unapproved CSRs"
       kubernetes.core.k8s_info:
         api_version: certificates.k8s.io/v1
         kind: CertificateSigningRequest
@@ -125,23 +163,53 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: csr_result
 
-    - name: "[NODE STATUS] Show pending CSRs"
-      ansible.builtin.debug:
-        msg: >-
-          PENDING CSR: {{ item.metadata.name }}
-          signer={{ item.spec.signerName }}
-          requestor={{ item.spec.username }}
-          created={{ item.metadata.creationTimestamp }}
+    - name: "[1/4 NODE] Build pending CSR display lines"
+      ansible.builtin.set_fact:
+        _csr_lines: >-
+          {{
+            _csr_lines | default([]) + [
+              '[WARN] ' + item.metadata.name
+              + '  signer=' + item.spec.signerName
+              + '  requestor=' + item.spec.username
+              + '  created=' + item.metadata.creationTimestamp
+            ]
+          }}
+        _issues: >-
+          {{
+            _issues + [
+              '[WARN] Pending CSR: ' + item.metadata.name
+              + ' (requestor=' + item.spec.username + ')'
+            ]
+          }}
       loop: "{{ csr_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
       when: >-
-        (item.status.conditions is not defined or item.status.conditions | length == 0)
+        item.status.conditions is not defined or item.status.conditions | length == 0
+
+    - name: "[1/4 NODE] Section report"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['',
+             '============================================================',
+             '  [1/4] NODE STATUS',
+             '  Purpose : All nodes must be Ready for workloads to run.',
+             '            Pending CSRs block node bootstrapping and cert',
+             '            renewal -- approve or investigate promptly.',
+             '------------------------------------------------------------',
+             '  Nodes (' + (nodes_result.resources | length | string) + ' total):']
+            + (_node_lines | default(['  (no nodes found)']))
+            + ['------------------------------------------------------------',
+               '  Pending CSRs (' + ((_csr_lines | default([])) | length | string) + '):']
+            + (_csr_lines | default(['  [OK]   None']))
+            + ['============================================================', '']
+          }}
 
     # =========================================================================
     # 2. MACHINE CONFIG OPERATOR STATUS
     # =========================================================================
-    - name: "[MCO STATUS] Get MachineConfigPools"
+    - name: "[2/4 MCO] Get MachineConfigPools"
       kubernetes.core.k8s_info:
         api_version: machineconfiguration.openshift.io/v1
         kind: MachineConfigPool
@@ -153,61 +221,101 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: mcp_result
 
-    - name: "[MCO STATUS] Summarise MachineConfigPools"
-      ansible.builtin.debug:
-        msg: >-
-          MCP={{ item.metadata.name }}
-          UPDATED={{ item.status.conditions
-                      | selectattr('type', 'equalto', 'Updated')
-                      | map(attribute='status')
-                      | first | default('Unknown') }}
-          UPDATING={{ item.status.conditions
-                       | selectattr('type', 'equalto', 'Updating')
-                       | map(attribute='status')
-                       | first | default('Unknown') }}
-          DEGRADED={{ item.status.conditions
-                       | selectattr('type', 'equalto', 'Degraded')
-                       | map(attribute='status')
-                       | first | default('Unknown') }}
-          machineCount={{ item.status.machineCount }}
-          readyMachineCount={{ item.status.readyMachineCount }}
-          updatedMachineCount={{ item.status.updatedMachineCount }}
-          degradedMachineCount={{ item.status.degradedMachineCount }}
+    - name: "[2/4 MCO] Build MachineConfigPool display lines"
+      ansible.builtin.set_fact:
+        _mcp_lines: >-
+          {{
+            _mcp_lines | default([]) + [
+              ('[OK]   ' if _degraded != 'True' else '[CRIT] ')
+              + item.metadata.name
+              + '  updated=' + _updated
+              + '  updating=' + _updating
+              + '  degraded=' + _degraded
+              + '  machines=' + (item.status.machineCount | string)
+              + '  ready=' + (item.status.readyMachineCount | string)
+            ]
+          }}
+        _issues: >-
+          {{
+            _issues + (
+              ['[CRIT] MachineConfigPool ' + item.metadata.name
+               + ' is DEGRADED (degradedMachineCount='
+               + (item.status.degradedMachineCount | string) + ')']
+              if _degraded == 'True' else []
+            )
+          }}
+      vars:
+        _updated: >-
+          {{ item.status.conditions | selectattr('type', 'equalto', 'Updated')
+             | map(attribute='status') | first | default('Unknown') }}
+        _updating: >-
+          {{ item.status.conditions | selectattr('type', 'equalto', 'Updating')
+             | map(attribute='status') | first | default('Unknown') }}
+        _degraded: >-
+          {{ item.status.conditions | selectattr('type', 'equalto', 'Degraded')
+             | map(attribute='status') | first | default('Unknown') }}
       loop: "{{ mcp_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
 
-    - name: "[MCO STATUS] Warn on degraded MachineConfigPools"
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: MachineConfigPool {{ item.metadata.name }} is DEGRADED
-          (degradedMachineCount={{ item.status.degradedMachineCount }})
-      loop: "{{ mcp_result.resources }}"
-      loop_control:
-        label: "{{ item.metadata.name }}"
-      when: >-
-        (item.status.conditions
-          | selectattr('type', 'equalto', 'Degraded')
-          | map(attribute='status')
-          | first | default('False')) == 'True'
-
-    - name: "[MCO STATUS] Show node-level MCO state via node annotations"
-      ansible.builtin.debug:
-        msg: >-
-          NODE={{ item.metadata.name }}
-          currentConfig={{ item.metadata.annotations['machineconfiguration.openshift.io/currentConfig'] | default('N/A') }}
-          desiredConfig={{ item.metadata.annotations['machineconfiguration.openshift.io/desiredConfig'] | default('N/A') }}
-          state={{ item.metadata.annotations['machineconfiguration.openshift.io/state'] | default('N/A') }}
-          IN_SYNC={{ (item.metadata.annotations['machineconfiguration.openshift.io/currentConfig'] | default(''))
-                     == (item.metadata.annotations['machineconfiguration.openshift.io/desiredConfig'] | default('')) }}
+    - name: "[2/4 MCO] Build per-node MCO sync display lines"
+      ansible.builtin.set_fact:
+        _mco_node_lines: >-
+          {{
+            _mco_node_lines | default([]) + [
+              ('[OK]   ' if _in_sync else '[WARN] ')
+              + item.metadata.name
+              + '  state=' + _state
+              + '  in_sync=' + (_in_sync | string)
+            ]
+          }}
+        _issues: >-
+          {{
+            _issues + (
+              ['[WARN] Node ' + item.metadata.name
+               + ' MCO config out of sync (state=' + _state + ')']
+              if not _in_sync else []
+            )
+          }}
+      vars:
+        _current: >-
+          {{ item.metadata.annotations['machineconfiguration.openshift.io/currentConfig']
+             | default('') }}
+        _desired: >-
+          {{ item.metadata.annotations['machineconfiguration.openshift.io/desiredConfig']
+             | default('') }}
+        _state: >-
+          {{ item.metadata.annotations['machineconfiguration.openshift.io/state']
+             | default('N/A') }}
+        _in_sync: "{{ _current != '' and _current == _desired }}"
       loop: "{{ nodes_result.resources }}"
       loop_control:
         label: "{{ item.metadata.name }}"
 
+    - name: "[2/4 MCO] Section report"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['',
+             '============================================================',
+             '  [2/4] MACHINE CONFIG OPERATOR (MCO) STATUS',
+             '  Purpose : MCO applies OS-level config (kernel args, certs,',
+             '            etc.) to every node via MachineConfigPools.',
+             '            A degraded pool or out-of-sync node needs',
+             '            investigation before applying further changes.',
+             '------------------------------------------------------------',
+             '  MachineConfigPools (' + (mcp_result.resources | length | string) + '):']
+            + (_mcp_lines | default(['  (none found)']))
+            + ['------------------------------------------------------------',
+               '  Per-node MCO config sync:']
+            + (_mco_node_lines | default(['  (none found)']))
+            + ['============================================================', '']
+          }}
+
     # =========================================================================
     # 3. ETCD STATUS
     # =========================================================================
-    - name: "[ETCD STATUS] Get etcd pods (openshift-etcd)"
+    - name: "[3/4 ETCD] Get etcd pods (openshift-etcd)"
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Pod
@@ -222,7 +330,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_pods_result
 
-    - name: "[ETCD STATUS] Select a Running etcd pod"
+    - name: "[3/4 ETCD] Select a Running etcd pod"
       ansible.builtin.set_fact:
         etcd_pod_name: >-
           {{
@@ -232,7 +340,7 @@
             | first
           }}
 
-    - name: "[ETCD STATUS] etcdctl endpoint health"
+    - name: "[3/4 ETCD] etcdctl endpoint health"
       kubernetes.core.k8s_exec:
         namespace: openshift-etcd
         pod: "{{ etcd_pod_name }}"
@@ -246,11 +354,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_health_result
 
-    - name: "[ETCD STATUS] Show etcdctl endpoint health"
-      ansible.builtin.debug:
-        msg: "{{ etcd_health_result.stdout_lines }}"
-
-    - name: "[ETCD STATUS] etcdctl endpoint status"
+    - name: "[3/4 ETCD] etcdctl endpoint status"
       kubernetes.core.k8s_exec:
         namespace: openshift-etcd
         pod: "{{ etcd_pod_name }}"
@@ -264,11 +368,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_status_result
 
-    - name: "[ETCD STATUS] Show etcdctl endpoint status"
-      ansible.builtin.debug:
-        msg: "{{ etcd_status_result.stdout_lines }}"
-
-    - name: "[ETCD STATUS] etcdctl member list"
+    - name: "[3/4 ETCD] etcdctl member list"
       kubernetes.core.k8s_exec:
         namespace: openshift-etcd
         pod: "{{ etcd_pod_name }}"
@@ -282,14 +382,45 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_members_result
 
-    - name: "[ETCD STATUS] Show etcdctl member list"
+    - name: "[3/4 ETCD] Track unhealthy endpoints"
+      ansible.builtin.set_fact:
+        _etcd_health_ok: "{{ 'false' not in (etcd_health_result.stdout | lower) }}"
+        _issues: >-
+          {{
+            _issues + (
+              ['[CRIT] ETCD endpoint health reports unhealthy member(s)'
+               + ' -- see Section 3 output above']
+              if 'false' in (etcd_health_result.stdout | lower) else []
+            )
+          }}
+
+    - name: "[3/4 ETCD] Section report"
       ansible.builtin.debug:
-        msg: "{{ etcd_members_result.stdout_lines }}"
+        msg: >-
+          {{
+            ['',
+             '============================================================',
+             '  [3/4] ETCD STATUS',
+             '  Purpose : ETCD is the cluster state database. All members',
+             '            must be healthy and a leader must be elected.',
+             '            Quorum loss (< 2 of 3 healthy) causes API downtime.',
+             '            healthy=true = OK  |  isLeader=true = current leader',
+             '------------------------------------------------------------',
+             '  Endpoint Health (all members should show healthy=true):']
+            + etcd_health_result.stdout_lines
+            + ['',
+               '  Endpoint Status (DB size, raftTerm, leader):']
+            + etcd_status_result.stdout_lines
+            + ['',
+               '  Member List:']
+            + etcd_members_result.stdout_lines
+            + ['============================================================', '']
+          }}
 
     # =========================================================================
     # 4. Default Ingress Certificate
     # =========================================================================
-    - name: "[INGRESS CERT] Get default IngressController"
+    - name: "[4/4 CERT] Get default IngressController"
       kubernetes.core.k8s_info:
         api_version: operator.openshift.io/v1
         kind: IngressController
@@ -303,7 +434,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: ingress_ctrl_result
 
-    - name: "[INGRESS CERT] Resolve certificate secret name"
+    - name: "[4/4 CERT] Resolve certificate secret name"
       ansible.builtin.set_fact:
         ingress_cert_secret_name: >-
           {{
@@ -315,7 +446,7 @@
             else 'router-certs-default'
           }}
 
-    - name: "[INGRESS CERT] Get certificate secret from openshift-ingress"
+    - name: "[4/4 CERT] Get certificate secret from openshift-ingress"
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Secret
@@ -329,7 +460,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: ingress_secret_result
 
-    - name: "[INGRESS CERT] Decode tls.crt from secret"
+    - name: "[4/4 CERT] Decode tls.crt from secret"
       ansible.builtin.set_fact:
         ingress_tls_crt: >-
           {{ ingress_secret_result.resources[0].data['tls.crt'] | b64decode }}
@@ -337,30 +468,34 @@
         ingress_secret_result.resources | length > 0
         and ingress_secret_result.resources[0].data['tls.crt'] is defined
 
-    - name: "[INGRESS CERT] Warn when secret is missing or empty"
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: Secret {{ ingress_cert_secret_name }} not found in namespace
-          openshift-ingress or has invalid data.
+    - name: "[4/4 CERT] Track missing secret"
+      ansible.builtin.set_fact:
+        _issues: >-
+          {{
+            _issues + [
+              '[CRIT] Ingress cert secret ' + ingress_cert_secret_name
+              + ' not found in namespace openshift-ingress'
+            ]
+          }}
       when: >-
         ingress_secret_result.resources | length == 0
         or ingress_secret_result.resources[0].data['tls.crt'] is not defined
 
-    - name: "[INGRESS CERT] Create temp file for certificate"
+    - name: "[4/4 CERT] Create temp file for certificate"
       ansible.builtin.tempfile:
         state: file
         suffix: .crt
       register: ingress_cert_tmp
       when: ingress_tls_crt is defined
 
-    - name: "[INGRESS CERT] Write cert to temp file"
+    - name: "[4/4 CERT] Write cert to temp file"
       ansible.builtin.copy:
         content: "{{ ingress_tls_crt }}"
         dest: "{{ ingress_cert_tmp.path }}"
         mode: '0600'
       when: ingress_tls_crt is defined and ingress_cert_tmp is defined
 
-    - name: "[INGRESS CERT] Inspect certificate with openssl"
+    - name: "[4/4 CERT] Inspect certificate with openssl"
       # Requires GNU date (Linux / RHEL). openssl called once; notAfter parsed from its output.
       ansible.builtin.shell: |
         set -e
@@ -374,7 +509,7 @@
       register: ingress_cert_raw
       when: ingress_tls_crt is defined and ingress_cert_tmp is defined
 
-    - name: "[INGRESS CERT] Parse days remaining"
+    - name: "[4/4 CERT] Parse days remaining"
       ansible.builtin.set_fact:
         ingress_cert_days_remaining: >-
           {{
@@ -385,36 +520,138 @@
           }}
       when: ingress_tls_crt is defined and ingress_cert_raw is defined
 
-    - name: "[INGRESS CERT] Show certificate validity"
+    - name: "[4/4 CERT] Track certificate issues"
+      ansible.builtin.set_fact:
+        _issues: >-
+          {{
+            _issues + (
+              ['[CRIT] Ingress certificate EXPIRED! (secret=' + ingress_cert_secret_name + ')']
+              if ingress_cert_days_remaining | int <= 0
+              else (
+                ['[WARN] Ingress certificate expires in '
+                 + (ingress_cert_days_remaining | string) + ' days'
+                 + ' (threshold=' + (cert_warning_days | string) + ')']
+                if ingress_cert_days_remaining | int < cert_warning_days | int
+                else []
+              )
+            )
+          }}
+      when: ingress_cert_days_remaining is defined
+
+    - name: "[4/4 CERT] Section report"
       ansible.builtin.debug:
         msg: >-
-          Secret={{ ingress_cert_secret_name }} (namespace: openshift-ingress)
-          {{ ingress_cert_raw.stdout_lines | reject('match', '^days_remaining=') | join(' | ') }}
-          days_remaining={{ ingress_cert_days_remaining }}
-      when: ingress_tls_crt is defined and ingress_cert_raw is defined
+          {{
+            ['',
+             '============================================================',
+             '  [4/4] DEFAULT INGRESS CERTIFICATE',
+             '  Purpose : The wildcard cert covers *.apps.<cluster>.',
+             '            An expired cert instantly breaks HTTPS on all',
+             '            routes. Plan renewal at least 30 days before expiry.',
+             '------------------------------------------------------------',
+             '  Secret  : ' + ingress_cert_secret_name
+             + '  (namespace: openshift-ingress)']
+            + (
+                (ingress_cert_raw.stdout_lines
+                 | default([])
+                 | reject('match', '^days_remaining=')
+                 | list)
+                + ['',
+                   '  Days remaining : ' + (ingress_cert_days_remaining | string),
+                   '  Status         : '
+                   + (
+                       '[CRIT] EXPIRED - renew immediately!'
+                       if ingress_cert_days_remaining | int <= 0
+                       else (
+                         '[WARN] Expiring in ' + (ingress_cert_days_remaining | string)
+                         + ' days - plan renewal now'
+                         if ingress_cert_days_remaining | int < cert_warning_days | int
+                         else '[OK]   Valid for ' + (ingress_cert_days_remaining | string)
+                              + ' more days'
+                       )
+                     )]
+                if ingress_cert_days_remaining is defined
+                else ['  [CRIT] Certificate secret not found or has no tls.crt data.']
+              )
+            + ['============================================================', '']
+          }}
 
-    - name: "[INGRESS CERT] Warn if certificate is expired"
-      ansible.builtin.debug:
-        msg: "CRITICAL: Ingress certificate {{ ingress_cert_secret_name }} is EXPIRED!"
-      when:
-        - ingress_tls_crt is defined
-        - ingress_cert_days_remaining is defined
-        - ingress_cert_days_remaining | int <= 0
-
-    - name: "[INGRESS CERT] Warn if certificate is expiring soon"
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: Ingress certificate {{ ingress_cert_secret_name }} expires within
-          {{ cert_warning_days }} days
-          (days_remaining={{ ingress_cert_days_remaining }})
-      when:
-        - ingress_tls_crt is defined
-        - ingress_cert_days_remaining is defined
-        - ingress_cert_days_remaining | int > 0
-        - ingress_cert_days_remaining | int < cert_warning_days | int
-
-    - name: "[INGRESS CERT] Remove temp cert file"
+    - name: "[4/4 CERT] Remove temp cert file"
       ansible.builtin.file:
         path: "{{ ingress_cert_tmp.path }}"
         state: absent
       when: ingress_cert_tmp is defined and ingress_cert_tmp.path is defined
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    - name: ">>> CLUSTER HEALTH SUMMARY <<<"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['',
+             '============================================================',
+             '  OCP CLUSTER DAILY INSPECTION - SUMMARY',
+             '  Completed : ' + now(utc=true, fmt='%Y-%m-%d %H:%M UTC'),
+             '============================================================',
+             '  OVERALL STATUS : '
+             + ('** ALL CLEAR - No issues detected **'
+                if _issues | length == 0
+                else ('** ' + (_issues | length | string) + ' ISSUE(S) FOUND **')),
+             '------------------------------------------------------------',
+             '  Nodes       : '
+             + ((_node_lines | default([]) | select('match', '^\[OK\]') | list | length) | string)
+             + ' / ' + (nodes_result.resources | length | string) + ' Ready'
+             + ('  [OK]'
+                if (_node_lines | default([]) | select('match', '^\[CRIT\]') | list | length) == 0
+                else '  [CRIT]'),
+             '  CSR         : '
+             + ((_csr_lines | default([])) | length | string) + ' pending'
+             + ('  [OK]'
+                if (_csr_lines | default([]) | length) == 0
+                else '  [WARN]'),
+             '  MCO Pools   : '
+             + ((_mcp_lines | default([]) | select('match', '^\[OK\]') | list | length) | string)
+             + ' / ' + (_mcp_lines | default([]) | length | string) + ' healthy'
+             + ('  [OK]'
+                if (_mcp_lines | default([]) | select('match', '^\[CRIT\]') | list | length) == 0
+                else '  [CRIT]'),
+             '  MCO Nodes   : '
+             + ((_mco_node_lines | default([]) | select('match', '^\[OK\]') | list | length) | string)
+             + ' / ' + (_mco_node_lines | default([]) | length | string) + ' in-sync'
+             + ('  [OK]'
+                if (_mco_node_lines | default([]) | select('match', '^\[WARN\]') | list | length) == 0
+                else '  [WARN]'),
+             '  ETCD        : '
+             + ('[OK]   All endpoints healthy'
+                if (_etcd_health_ok | default(true))
+                else '[CRIT] Unhealthy endpoint(s) detected'),
+             '  Ingress Cert: '
+             + (
+                 '[OK]   ' + (ingress_cert_days_remaining | string) + ' days remaining'
+                 if ingress_cert_days_remaining is defined
+                    and ingress_cert_days_remaining | int > cert_warning_days | int
+                 else (
+                   '[WARN] ' + (ingress_cert_days_remaining | string) + ' days remaining'
+                   if ingress_cert_days_remaining is defined
+                      and ingress_cert_days_remaining | int > 0
+                   else (
+                     '[CRIT] EXPIRED'
+                     if ingress_cert_days_remaining is defined
+                        and ingress_cert_days_remaining | int <= 0
+                     else '[CRIT] Secret not found'
+                   )
+                 )
+               ),
+             '------------------------------------------------------------']
+            + (
+                ['  Issues found:']
+                + (_issues | map('regex_replace', '^', '    ') | list)
+                if _issues | length > 0
+                else ['  No issues detected.']
+              )
+            + ['============================================================',
+               '  Tip: Search for [CRIT] or [WARN] in this job output',
+               '       to jump directly to problem details.',
+               '============================================================', '']
+          }}
