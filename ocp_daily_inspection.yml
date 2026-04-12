@@ -612,7 +612,7 @@
       register: node_metrics_result
       ignore_errors: true
 
-    - name: "[5/5 RESOURCE] Build per-node resource display lines"
+    - name: "[5/5 RESOURCE] Build per-node resource display lines and track alerts"
       ansible.builtin.set_fact:
         _resource_lines: >-
           {{
@@ -624,103 +624,6 @@
               + '  disk=' + _disk_status
             ]
           }}
-      vars:
-        # ── find allocatable values from the already-fetched nodes list ─────
-        _node_info: >-
-          {{ nodes_result.resources
-             | selectattr('metadata.name', 'equalto', item.metadata.name)
-             | first }}
-
-        # ── CPU: convert to millicores ───────────────────────────────────────
-        # usage.cpu may be: "500m" | "2" | "1234567890n"
-        _cpu_usage_m: >-
-          {{
-            (item.usage.cpu | regex_replace('n$', '') | int // 1000000)
-            if (item.usage.cpu | string | regex_search('n$'))
-            else (
-              (item.usage.cpu | regex_replace('m$', '') | int)
-              if (item.usage.cpu | string | regex_search('m$'))
-              else (item.usage.cpu | int * 1000)
-            )
-          }}
-        # allocatable.cpu may be: "4" | "4000m"
-        _cpu_alloc_m: >-
-          {{
-            (_node_info.status.allocatable.cpu | regex_replace('m$', '') | int)
-            if (_node_info.status.allocatable.cpu | string | regex_search('m$'))
-            else (_node_info.status.allocatable.cpu | int * 1000)
-          }}
-        _cpu_pct: >-
-          {{ ((_cpu_usage_m | int * 100) // (_cpu_alloc_m | int)) if (_cpu_alloc_m | int) > 0 else 0 }}
-
-        # ── Memory: convert to KiB ───────────────────────────────────────────
-        # usage.memory / allocatable.memory may be: "4096Ki" | "4Mi" | "4Gi" | raw bytes
-        _mem_usage_ki: >-
-          {{
-            (item.usage.memory | regex_replace('Ki$', '') | int)
-            if (item.usage.memory | string | regex_search('Ki$'))
-            else (
-              (item.usage.memory | regex_replace('Mi$', '') | int * 1024)
-              if (item.usage.memory | string | regex_search('Mi$'))
-              else (
-                (item.usage.memory | regex_replace('Gi$', '') | int * 1048576)
-                if (item.usage.memory | string | regex_search('Gi$'))
-                else (item.usage.memory | int // 1024)
-              )
-            )
-          }}
-        _mem_alloc_ki: >-
-          {{
-            (_node_info.status.allocatable.memory | regex_replace('Ki$', '') | int)
-            if (_node_info.status.allocatable.memory | string | regex_search('Ki$'))
-            else (
-              (_node_info.status.allocatable.memory | regex_replace('Mi$', '') | int * 1024)
-              if (_node_info.status.allocatable.memory | string | regex_search('Mi$'))
-              else (
-                (_node_info.status.allocatable.memory | regex_replace('Gi$', '') | int * 1048576)
-                if (_node_info.status.allocatable.memory | string | regex_search('Gi$'))
-                else (_node_info.status.allocatable.memory | int // 1024)
-              )
-            )
-          }}
-        _mem_pct: >-
-          {{ ((_mem_usage_ki | int * 100) // (_mem_alloc_ki | int)) if (_mem_alloc_ki | int) > 0 else 0 }}
-
-        # ── Disk: kubelet DiskPressure condition ─────────────────────────────
-        _disk_pressure: >-
-          {{ _node_info.status.conditions
-             | selectattr('type', 'equalto', 'DiskPressure')
-             | map(attribute='status') | first | string }}
-        _disk_status: "{{ 'PRESSURE' if _disk_pressure == 'True' else 'OK' }}"
-
-        # ── Severity level ───────────────────────────────────────────────────
-        _level: >-
-          {{
-            '[CRIT] ' if (
-              (_cpu_pct | int >= node_cpu_crit_pct | int)
-              or (_mem_pct | int >= node_memory_crit_pct | int)
-              or _disk_pressure == 'True'
-            )
-            else (
-              '[WARN] ' if (
-                (_cpu_pct | int >= node_cpu_warn_pct | int)
-                or (_mem_pct | int >= node_memory_warn_pct | int)
-              )
-              else '[OK]   '
-            )
-          }}
-
-      loop: >-
-        {{
-          node_metrics_result.resources
-          | default([])
-          | sort(attribute='metadata.name')
-        }}
-      loop_control:
-        label: "{{ item.metadata.name }}"
-
-    - name: "[5/5 RESOURCE] Track resource alerts"
-      ansible.builtin.set_fact:
         _issues: >-
           {{
             _issues
@@ -753,10 +656,14 @@
               )
           }}
       vars:
+        # ── find allocatable values from the already-fetched nodes list ─────
         _node_info: >-
           {{ nodes_result.resources
              | selectattr('metadata.name', 'equalto', item.metadata.name)
              | first }}
+
+        # ── CPU: convert to millicores ───────────────────────────────────────
+        # usage.cpu may be: "500m" | "2" | "1234567890n"
         _cpu_usage_m: >-
           {{
             (item.usage.cpu | regex_replace('n$', '') | int // 1000000)
@@ -767,6 +674,7 @@
               else (item.usage.cpu | int * 1000)
             )
           }}
+        # allocatable.cpu may be: "4" | "4000m"
         _cpu_alloc_m: >-
           {{
             (_node_info.status.allocatable.cpu | regex_replace('m$', '') | int)
@@ -774,7 +682,10 @@
             else (_node_info.status.allocatable.cpu | int * 1000)
           }}
         _cpu_pct: >-
-          {{ ((_cpu_usage_m | int * 100) // (_cpu_alloc_m | int)) if (_cpu_alloc_m | int) > 0 else 0 }}
+          {{ ((_cpu_usage_m | float * 100) / (_cpu_alloc_m | float)) | round | int if (_cpu_alloc_m | int) > 0 else 0 }}
+
+        # ── Memory: convert to KiB ───────────────────────────────────────────
+        # usage.memory / allocatable.memory may be: "4096Ki" | "4Mi" | "4Gi" | raw bytes
         _mem_usage_ki: >-
           {{
             (item.usage.memory | regex_replace('Ki$', '') | int)
@@ -804,11 +715,32 @@
             )
           }}
         _mem_pct: >-
-          {{ ((_mem_usage_ki | int * 100) // (_mem_alloc_ki | int)) if (_mem_alloc_ki | int) > 0 else 0 }}
+          {{ ((_mem_usage_ki | float * 100) / (_mem_alloc_ki | float)) | round | int if (_mem_alloc_ki | int) > 0 else 0 }}
+
+        # ── Disk: kubelet DiskPressure condition ─────────────────────────────
         _disk_pressure: >-
           {{ _node_info.status.conditions
              | selectattr('type', 'equalto', 'DiskPressure')
              | map(attribute='status') | first | string }}
+        _disk_status: "{{ 'PRESSURE' if _disk_pressure == 'True' else 'OK' }}"
+
+        # ── Severity level ───────────────────────────────────────────────────
+        _level: >-
+          {{
+            '[CRIT] ' if (
+              (_cpu_pct | int >= node_cpu_crit_pct | int)
+              or (_mem_pct | int >= node_memory_crit_pct | int)
+              or _disk_pressure == 'True'
+            )
+            else (
+              '[WARN] ' if (
+                (_cpu_pct | int >= node_cpu_warn_pct | int)
+                or (_mem_pct | int >= node_memory_warn_pct | int)
+              )
+              else '[OK]   '
+            )
+          }}
+
       loop: >-
         {{
           node_metrics_result.resources
