@@ -47,6 +47,12 @@
     # --- Thresholds -----------------------------------------------------------
     cert_warning_days: 30   # warn when certificate expires within this many days
 
+    # Node resource thresholds (percentage, 0-100)
+    node_cpu_warn_pct:    80   # [WARN] when node CPU usage exceeds this %
+    node_cpu_crit_pct:    90   # [CRIT] when node CPU usage exceeds this %
+    node_memory_warn_pct: 85   # [WARN] when node memory usage exceeds this %
+    node_memory_crit_pct: 95   # [CRIT] when node memory usage exceeds this %
+
   # ---------------------------------------------------------------------------
   # Common connection arguments built dynamically so both auth options work.
   # ---------------------------------------------------------------------------
@@ -79,7 +85,7 @@
           - "  OCP Cluster Daily Inspection"
           - "  Time    : {{ now(utc=true, fmt='%Y-%m-%d %H:%M UTC') }}"
           - "============================================================"
-          - "  Checks  : 1=Nodes/CSR  2=MCO  3=ETCD  4=Ingress Cert"
+          - "  Checks  : 1=Nodes/CSR  2=MCO  3=ETCD  4=Ingress Cert  5=Resources"
           - "------------------------------------------------------------"
           - "  How to read this output:"
           - "    [OK]   = Normal, no action needed"
@@ -93,7 +99,7 @@
     # =========================================================================
     # 1. NODE STATUS
     # =========================================================================
-    - name: "[1/4 NODE] Get all nodes"
+    - name: "[1/5 NODE] Get all nodes"
       kubernetes.core.k8s_info:
         kind: Node
         api_version: v1
@@ -105,7 +111,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: nodes_result
 
-    - name: "[1/4 NODE] Build per-node display line"
+    - name: "[1/5 NODE] Build per-node display line"
       ansible.builtin.set_fact:
         _node_lines: >-
           {{
@@ -132,7 +138,7 @@
       loop_control:
         label: "{{ item.metadata.name }}"
 
-    - name: "[1/4 NODE] Track not-ready nodes"
+    - name: "[1/5 NODE] Track not-ready nodes"
       ansible.builtin.set_fact:
         _issues: >-
           {{
@@ -151,7 +157,7 @@
           | selectattr('type', 'equalto', 'Ready')
           | map(attribute='status') | first | string) != 'True'
 
-    - name: "[1/4 NODE] Get pending / unapproved CSRs"
+    - name: "[1/5 NODE] Get pending / unapproved CSRs"
       kubernetes.core.k8s_info:
         api_version: certificates.k8s.io/v1
         kind: CertificateSigningRequest
@@ -163,7 +169,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: csr_result
 
-    - name: "[1/4 NODE] Build pending CSR display lines"
+    - name: "[1/5 NODE] Build pending CSR display lines"
       ansible.builtin.set_fact:
         _csr_lines: >-
           {{
@@ -187,13 +193,13 @@
       when: >-
         item.status.conditions is not defined or item.status.conditions | length == 0
 
-    - name: "[1/4 NODE] Section report"
+    - name: "[1/5 NODE] Section report"
       ansible.builtin.debug:
         msg: >-
           {{
             ['',
              '============================================================',
-             '  [1/4] NODE STATUS',
+             '  [1/5] NODE STATUS',
              '  Purpose : All nodes must be Ready for workloads to run.',
              '            Pending CSRs block node bootstrapping and cert',
              '            renewal -- approve or investigate promptly.',
@@ -209,7 +215,7 @@
     # =========================================================================
     # 2. MACHINE CONFIG OPERATOR STATUS
     # =========================================================================
-    - name: "[2/4 MCO] Get MachineConfigPools"
+    - name: "[2/5 MCO] Get MachineConfigPools"
       kubernetes.core.k8s_info:
         api_version: machineconfiguration.openshift.io/v1
         kind: MachineConfigPool
@@ -221,7 +227,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: mcp_result
 
-    - name: "[2/4 MCO] Build MachineConfigPool display lines"
+    - name: "[2/5 MCO] Build MachineConfigPool display lines"
       ansible.builtin.set_fact:
         _mcp_lines: >-
           {{
@@ -258,7 +264,7 @@
       loop_control:
         label: "{{ item.metadata.name }}"
 
-    - name: "[2/4 MCO] Build per-node MCO sync display lines"
+    - name: "[2/5 MCO] Build per-node MCO sync display lines"
       ansible.builtin.set_fact:
         _mco_node_lines: >-
           {{
@@ -292,13 +298,13 @@
       loop_control:
         label: "{{ item.metadata.name }}"
 
-    - name: "[2/4 MCO] Section report"
+    - name: "[2/5 MCO] Section report"
       ansible.builtin.debug:
         msg: >-
           {{
             ['',
              '============================================================',
-             '  [2/4] MACHINE CONFIG OPERATOR (MCO) STATUS',
+             '  [2/5] MACHINE CONFIG OPERATOR (MCO) STATUS',
              '  Purpose : MCO applies OS-level config (kernel args, certs,',
              '            etc.) to every node via MachineConfigPools.',
              '            A degraded pool or out-of-sync node needs',
@@ -315,7 +321,7 @@
     # =========================================================================
     # 3. ETCD STATUS
     # =========================================================================
-    - name: "[3/4 ETCD] Get etcd pods (openshift-etcd)"
+    - name: "[3/5 ETCD] Get etcd pods (openshift-etcd)"
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Pod
@@ -330,7 +336,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_pods_result
 
-    - name: "[3/4 ETCD] Select a Running etcd pod"
+    - name: "[3/5 ETCD] Select a Running etcd pod"
       ansible.builtin.set_fact:
         etcd_pod_name: >-
           {{
@@ -340,7 +346,7 @@
             | first
           }}
 
-    - name: "[3/4 ETCD] etcdctl endpoint health"
+    - name: "[3/5 ETCD] etcdctl endpoint health"
       kubernetes.core.k8s_exec:
         namespace: openshift-etcd
         pod: "{{ etcd_pod_name }}"
@@ -354,7 +360,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_health_result
 
-    - name: "[3/4 ETCD] etcdctl endpoint status"
+    - name: "[3/5 ETCD] etcdctl endpoint status"
       kubernetes.core.k8s_exec:
         namespace: openshift-etcd
         pod: "{{ etcd_pod_name }}"
@@ -368,7 +374,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_status_result
 
-    - name: "[3/4 ETCD] etcdctl member list"
+    - name: "[3/5 ETCD] etcdctl member list"
       kubernetes.core.k8s_exec:
         namespace: openshift-etcd
         pod: "{{ etcd_pod_name }}"
@@ -382,7 +388,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: etcd_members_result
 
-    - name: "[3/4 ETCD] Track unhealthy endpoints"
+    - name: "[3/5 ETCD] Track unhealthy endpoints"
       ansible.builtin.set_fact:
         _etcd_health_ok: "{{ 'false' not in (etcd_health_result.stdout | lower) }}"
         _issues: >-
@@ -394,13 +400,13 @@
             )
           }}
 
-    - name: "[3/4 ETCD] Section report"
+    - name: "[3/5 ETCD] Section report"
       ansible.builtin.debug:
         msg: >-
           {{
             ['',
              '============================================================',
-             '  [3/4] ETCD STATUS',
+             '  [3/5] ETCD STATUS',
              '  Purpose : ETCD is the cluster state database. All members',
              '            must be healthy and a leader must be elected.',
              '            Quorum loss (< 2 of 3 healthy) causes API downtime.',
@@ -420,7 +426,7 @@
     # =========================================================================
     # 4. Default Ingress Certificate
     # =========================================================================
-    - name: "[4/4 CERT] Get default IngressController"
+    - name: "[4/5 CERT] Get default IngressController"
       kubernetes.core.k8s_info:
         api_version: operator.openshift.io/v1
         kind: IngressController
@@ -434,7 +440,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: ingress_ctrl_result
 
-    - name: "[4/4 CERT] Resolve certificate secret name"
+    - name: "[4/5 CERT] Resolve certificate secret name"
       ansible.builtin.set_fact:
         ingress_cert_secret_name: >-
           {{
@@ -446,7 +452,7 @@
             else 'router-certs-default'
           }}
 
-    - name: "[4/4 CERT] Get certificate secret from openshift-ingress"
+    - name: "[4/5 CERT] Get certificate secret from openshift-ingress"
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Secret
@@ -460,7 +466,7 @@
         validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
       register: ingress_secret_result
 
-    - name: "[4/4 CERT] Decode tls.crt from secret"
+    - name: "[4/5 CERT] Decode tls.crt from secret"
       ansible.builtin.set_fact:
         ingress_tls_crt: >-
           {{ ingress_secret_result.resources[0].data['tls.crt'] | b64decode }}
@@ -468,7 +474,7 @@
         ingress_secret_result.resources | length > 0
         and ingress_secret_result.resources[0].data['tls.crt'] is defined
 
-    - name: "[4/4 CERT] Track missing secret"
+    - name: "[4/5 CERT] Track missing secret"
       ansible.builtin.set_fact:
         _issues: >-
           {{
@@ -481,21 +487,21 @@
         ingress_secret_result.resources | length == 0
         or ingress_secret_result.resources[0].data['tls.crt'] is not defined
 
-    - name: "[4/4 CERT] Create temp file for certificate"
+    - name: "[4/5 CERT] Create temp file for certificate"
       ansible.builtin.tempfile:
         state: file
         suffix: .crt
       register: ingress_cert_tmp
       when: ingress_tls_crt is defined
 
-    - name: "[4/4 CERT] Write cert to temp file"
+    - name: "[4/5 CERT] Write cert to temp file"
       ansible.builtin.copy:
         content: "{{ ingress_tls_crt }}"
         dest: "{{ ingress_cert_tmp.path }}"
         mode: '0600'
       when: ingress_tls_crt is defined and ingress_cert_tmp is defined
 
-    - name: "[4/4 CERT] Inspect certificate with openssl"
+    - name: "[4/5 CERT] Inspect certificate with openssl"
       # Requires GNU date (Linux / RHEL). openssl called once; notAfter parsed from its output.
       ansible.builtin.shell: |
         set -e
@@ -509,7 +515,7 @@
       register: ingress_cert_raw
       when: ingress_tls_crt is defined and ingress_cert_tmp is defined
 
-    - name: "[4/4 CERT] Parse days remaining"
+    - name: "[4/5 CERT] Parse days remaining"
       ansible.builtin.set_fact:
         ingress_cert_days_remaining: >-
           {{
@@ -520,7 +526,7 @@
           }}
       when: ingress_tls_crt is defined and ingress_cert_raw is defined
 
-    - name: "[4/4 CERT] Track certificate issues"
+    - name: "[4/5 CERT] Track certificate issues"
       ansible.builtin.set_fact:
         _issues: >-
           {{
@@ -538,13 +544,13 @@
           }}
       when: ingress_cert_days_remaining is defined
 
-    - name: "[4/4 CERT] Section report"
+    - name: "[4/5 CERT] Section report"
       ansible.builtin.debug:
         msg: >-
           {{
             ['',
              '============================================================',
-             '  [4/4] DEFAULT INGRESS CERTIFICATE',
+             '  [4/5] DEFAULT INGRESS CERTIFICATE',
              '  Purpose : The wildcard cert covers *.apps.<cluster>.',
              '            An expired cert instantly breaks HTTPS on all',
              '            routes. Plan renewal at least 30 days before expiry.',
@@ -576,15 +582,264 @@
             + ['============================================================', '']
           }}
 
-    - name: "[4/4 CERT] Remove temp cert file"
+    - name: "[4/5 CERT] Remove temp cert file"
       ansible.builtin.file:
         path: "{{ ingress_cert_tmp.path }}"
         state: absent
       when: ingress_cert_tmp is defined and ingress_cert_tmp.path is defined
 
     # =========================================================================
-    # FINAL SUMMARY
+    # 5. NODE RESOURCE USAGE (CPU / Memory / Disk)
     # =========================================================================
+    # CPU + Memory: fetched from the Kubernetes Metrics API (requires metrics-server,
+    #               which is included by default in OpenShift).
+    #               Usage % = usage / allocatable × 100.
+    # Disk        : Derived from the kubelet-managed DiskPressure node condition.
+    #               DiskPressure=True means the kubelet has crossed its eviction
+    #               threshold (default ≥ 90 % used); no extra tooling required.
+    # =========================================================================
+
+    - name: "[5/5 RESOURCE] Get NodeMetrics (CPU + Memory)"
+      kubernetes.core.k8s_info:
+        api_version: metrics.k8s.io/v1beta1
+        kind: NodeMetrics
+        kubeconfig: "{{ k8s_auth.kubeconfig | default(omit) }}"
+        host: "{{ k8s_auth.host | default(omit) }}"
+        client_cert: "{{ k8s_auth.client_cert | default(omit) }}"
+        client_key: "{{ k8s_auth.client_key | default(omit) }}"
+        ca_cert: "{{ k8s_auth.ca_cert | default(omit) }}"
+        validate_certs: "{{ k8s_auth.validate_certs | default(omit) }}"
+      register: node_metrics_result
+      ignore_errors: true
+
+    - name: "[5/5 RESOURCE] Build per-node resource display lines"
+      ansible.builtin.set_fact:
+        _resource_lines: >-
+          {{
+            _resource_lines | default([]) + [
+              _level
+              + item.metadata.name
+              + '  cpu=' + (_cpu_pct | string) + '%'
+              + '  mem=' + (_mem_pct | string) + '%'
+              + '  disk=' + _disk_status
+            ]
+          }}
+      vars:
+        # ── find allocatable values from the already-fetched nodes list ─────
+        _node_info: >-
+          {{ nodes_result.resources
+             | selectattr('metadata.name', 'equalto', item.metadata.name)
+             | first }}
+
+        # ── CPU: convert to millicores ───────────────────────────────────────
+        # usage.cpu may be: "500m" | "2" | "1234567890n"
+        _cpu_usage_m: >-
+          {{
+            (item.usage.cpu | regex_replace('n$', '') | int // 1000000)
+            if (item.usage.cpu | string | regex_search('n$'))
+            else (
+              (item.usage.cpu | regex_replace('m$', '') | int)
+              if (item.usage.cpu | string | regex_search('m$'))
+              else (item.usage.cpu | int * 1000)
+            )
+          }}
+        # allocatable.cpu may be: "4" | "4000m"
+        _cpu_alloc_m: >-
+          {{
+            (_node_info.status.allocatable.cpu | regex_replace('m$', '') | int)
+            if (_node_info.status.allocatable.cpu | string | regex_search('m$'))
+            else (_node_info.status.allocatable.cpu | int * 1000)
+          }}
+        _cpu_pct: >-
+          {{ ((_cpu_usage_m | int * 100) // (_cpu_alloc_m | int)) if (_cpu_alloc_m | int) > 0 else 0 }}
+
+        # ── Memory: convert to KiB ───────────────────────────────────────────
+        # usage.memory / allocatable.memory may be: "4096Ki" | "4Mi" | "4Gi" | raw bytes
+        _mem_usage_ki: >-
+          {{
+            (item.usage.memory | regex_replace('Ki$', '') | int)
+            if (item.usage.memory | string | regex_search('Ki$'))
+            else (
+              (item.usage.memory | regex_replace('Mi$', '') | int * 1024)
+              if (item.usage.memory | string | regex_search('Mi$'))
+              else (
+                (item.usage.memory | regex_replace('Gi$', '') | int * 1048576)
+                if (item.usage.memory | string | regex_search('Gi$'))
+                else (item.usage.memory | int // 1024)
+              )
+            )
+          }}
+        _mem_alloc_ki: >-
+          {{
+            (_node_info.status.allocatable.memory | regex_replace('Ki$', '') | int)
+            if (_node_info.status.allocatable.memory | string | regex_search('Ki$'))
+            else (
+              (_node_info.status.allocatable.memory | regex_replace('Mi$', '') | int * 1024)
+              if (_node_info.status.allocatable.memory | string | regex_search('Mi$'))
+              else (
+                (_node_info.status.allocatable.memory | regex_replace('Gi$', '') | int * 1048576)
+                if (_node_info.status.allocatable.memory | string | regex_search('Gi$'))
+                else (_node_info.status.allocatable.memory | int // 1024)
+              )
+            )
+          }}
+        _mem_pct: >-
+          {{ ((_mem_usage_ki | int * 100) // (_mem_alloc_ki | int)) if (_mem_alloc_ki | int) > 0 else 0 }}
+
+        # ── Disk: kubelet DiskPressure condition ─────────────────────────────
+        _disk_pressure: >-
+          {{ _node_info.status.conditions
+             | selectattr('type', 'equalto', 'DiskPressure')
+             | map(attribute='status') | first | string }}
+        _disk_status: "{{ 'PRESSURE' if _disk_pressure == 'True' else 'OK' }}"
+
+        # ── Severity level ───────────────────────────────────────────────────
+        _level: >-
+          {{
+            '[CRIT] ' if (
+              (_cpu_pct | int >= node_cpu_crit_pct | int)
+              or (_mem_pct | int >= node_memory_crit_pct | int)
+              or _disk_pressure == 'True'
+            )
+            else (
+              '[WARN] ' if (
+                (_cpu_pct | int >= node_cpu_warn_pct | int)
+                or (_mem_pct | int >= node_memory_warn_pct | int)
+              )
+              else '[OK]   '
+            )
+          }}
+
+      loop: >-
+        {{
+          node_metrics_result.resources
+          | default([])
+          | sort(attribute='metadata.name')
+        }}
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "[5/5 RESOURCE] Track resource alerts"
+      ansible.builtin.set_fact:
+        _issues: >-
+          {{
+            _issues
+            + (
+                ['[CRIT] Node ' + item.metadata.name + ' CPU CRITICAL ('
+                 + (_cpu_pct | string) + '% >= ' + (node_cpu_crit_pct | string) + '%)']
+                if _cpu_pct | int >= node_cpu_crit_pct | int else []
+              )
+            + (
+                ['[WARN] Node ' + item.metadata.name + ' CPU high ('
+                 + (_cpu_pct | string) + '% >= ' + (node_cpu_warn_pct | string) + '%)']
+                if (_cpu_pct | int >= node_cpu_warn_pct | int
+                    and _cpu_pct | int < node_cpu_crit_pct | int) else []
+              )
+            + (
+                ['[CRIT] Node ' + item.metadata.name + ' Memory CRITICAL ('
+                 + (_mem_pct | string) + '% >= ' + (node_memory_crit_pct | string) + '%)']
+                if _mem_pct | int >= node_memory_crit_pct | int else []
+              )
+            + (
+                ['[WARN] Node ' + item.metadata.name + ' Memory high ('
+                 + (_mem_pct | string) + '% >= ' + (node_memory_warn_pct | string) + '%)']
+                if (_mem_pct | int >= node_memory_warn_pct | int
+                    and _mem_pct | int < node_memory_crit_pct | int) else []
+              )
+            + (
+                ['[CRIT] Node ' + item.metadata.name
+                 + ' DiskPressure detected (kubelet eviction threshold crossed)']
+                if _disk_pressure == 'True' else []
+              )
+          }}
+      vars:
+        _node_info: >-
+          {{ nodes_result.resources
+             | selectattr('metadata.name', 'equalto', item.metadata.name)
+             | first }}
+        _cpu_usage_m: >-
+          {{
+            (item.usage.cpu | regex_replace('n$', '') | int // 1000000)
+            if (item.usage.cpu | string | regex_search('n$'))
+            else (
+              (item.usage.cpu | regex_replace('m$', '') | int)
+              if (item.usage.cpu | string | regex_search('m$'))
+              else (item.usage.cpu | int * 1000)
+            )
+          }}
+        _cpu_alloc_m: >-
+          {{
+            (_node_info.status.allocatable.cpu | regex_replace('m$', '') | int)
+            if (_node_info.status.allocatable.cpu | string | regex_search('m$'))
+            else (_node_info.status.allocatable.cpu | int * 1000)
+          }}
+        _cpu_pct: >-
+          {{ ((_cpu_usage_m | int * 100) // (_cpu_alloc_m | int)) if (_cpu_alloc_m | int) > 0 else 0 }}
+        _mem_usage_ki: >-
+          {{
+            (item.usage.memory | regex_replace('Ki$', '') | int)
+            if (item.usage.memory | string | regex_search('Ki$'))
+            else (
+              (item.usage.memory | regex_replace('Mi$', '') | int * 1024)
+              if (item.usage.memory | string | regex_search('Mi$'))
+              else (
+                (item.usage.memory | regex_replace('Gi$', '') | int * 1048576)
+                if (item.usage.memory | string | regex_search('Gi$'))
+                else (item.usage.memory | int // 1024)
+              )
+            )
+          }}
+        _mem_alloc_ki: >-
+          {{
+            (_node_info.status.allocatable.memory | regex_replace('Ki$', '') | int)
+            if (_node_info.status.allocatable.memory | string | regex_search('Ki$'))
+            else (
+              (_node_info.status.allocatable.memory | regex_replace('Mi$', '') | int * 1024)
+              if (_node_info.status.allocatable.memory | string | regex_search('Mi$'))
+              else (
+                (_node_info.status.allocatable.memory | regex_replace('Gi$', '') | int * 1048576)
+                if (_node_info.status.allocatable.memory | string | regex_search('Gi$'))
+                else (_node_info.status.allocatable.memory | int // 1024)
+              )
+            )
+          }}
+        _mem_pct: >-
+          {{ ((_mem_usage_ki | int * 100) // (_mem_alloc_ki | int)) if (_mem_alloc_ki | int) > 0 else 0 }}
+        _disk_pressure: >-
+          {{ _node_info.status.conditions
+             | selectattr('type', 'equalto', 'DiskPressure')
+             | map(attribute='status') | first | string }}
+      loop: >-
+        {{
+          node_metrics_result.resources
+          | default([])
+          | sort(attribute='metadata.name')
+        }}
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "[5/5 RESOURCE] Section report"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['',
+             '============================================================',
+             '  [5/5] NODE RESOURCE USAGE',
+             '  Purpose : Identify nodes under CPU, memory, or disk pressure.',
+             '  Thresholds used:',
+             '    CPU    WARN >= ' + (node_cpu_warn_pct | string) + '%'
+             + '  CRIT >= ' + (node_cpu_crit_pct | string) + '%',
+             '    Memory WARN >= ' + (node_memory_warn_pct | string) + '%'
+             + '  CRIT >= ' + (node_memory_crit_pct | string) + '%',
+             '    Disk   DiskPressure condition (kubelet eviction threshold)',
+             '------------------------------------------------------------']
+            + (
+                _resource_lines | default(['  (metrics-server unavailable -- skipped)'])
+              )
+            + ['============================================================', '']
+          }}
+
+
     - name: ">>> CLUSTER HEALTH SUMMARY <<<"
       ansible.builtin.debug:
         msg: >-
@@ -640,6 +895,25 @@
                      if ingress_cert_days_remaining is defined
                         and ingress_cert_days_remaining | int <= 0
                      else '[CRIT] Secret not found'
+                   )
+                 )
+               ),
+             '  Resources   : '
+             + (
+                 'metrics unavailable (metrics-server may not be installed)'
+                 if (node_metrics_result is not defined
+                     or node_metrics_result.failed | default(false)
+                     or node_metrics_result.resources | default([]) | length == 0)
+                 else (
+                   '[CRIT] ' + (_resource_lines | default([]) | select('match', '^\[CRIT\]') | list | length | string)
+                   + ' node(s) with critical resource usage'
+                   if (_resource_lines | default([]) | select('match', '^\[CRIT\]') | list | length) > 0
+                   else (
+                     '[WARN] ' + (_resource_lines | default([]) | select('match', '^\[WARN\]') | list | length | string)
+                     + ' node(s) with high resource usage'
+                     if (_resource_lines | default([]) | select('match', '^\[WARN\]') | list | length) > 0
+                     else '[OK]   All ' + (_resource_lines | default([]) | length | string)
+                          + ' nodes within thresholds'
                    )
                  )
                ),
